@@ -1,97 +1,112 @@
+"""Caching proxy that wraps an HTTP client and stores responses locally."""
+
+from __future__ import annotations
+
 import hashlib
 import json
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
-import requests
+import urllib.request
+import urllib.error
 
 from .cache import Cache
+from .headers import filter_hop_by_hop, headers_for_cache_key
 
 
 class CachingProxy:
-    """A lightweight caching proxy that intercepts HTTP requests and caches responses."""
+    """Fetch URLs through a local cache.
 
-    def __init__(self, ttl: int = 300, cache_dir: Optional[str] = None):
-        """
-        Initialize the caching proxy.
+    Parameters
+    ----------
+    cache:
+        A :class:`~apicache_proxy.cache.Cache` instance used for storage.
+    ttl:
+        Default time-to-live in seconds for cached responses (default 300).
+    include_headers_in_key:
+        When *True*, request headers (after filtering) are folded into the
+        cache key so that different auth tokens produce separate entries.
+    """
 
-        Args:
-            ttl: Time-to-live for cached responses in seconds (default: 300).
-            cache_dir: Optional directory path for persistent cache storage.
-        """
-        self.ttl = ttl
-        self.cache = Cache(default_ttl=ttl, cache_dir=cache_dir)
+    def __init__(
+        self,
+        cache: Cache,
+        ttl: int = 300,
+        include_headers_in_key: bool = False,
+    ) -> None:
+        self._cache = cache
+        self._ttl = ttl
+        self._include_headers_in_key = include_headers_in_key
 
-    def _build_cache_key(self, method: str, url: str, params: Optional[dict] = None, body: Optional[dict] = None) -> str:
-        """Build a unique cache key from request components."""
-        key_parts = {
-            "method": method.upper(),
-            "url": url,
-            "params": params or {},
-            "body": body or {},
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_cache_key(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> str:
+        parts: Dict[str, Any] = {"method": method.upper(), "url": url}
+        if self._include_headers_in_key and headers:
+            parts["headers"] = headers_for_cache_key(headers)
+        raw = json.dumps(parts, sort_keys=True)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _fetch(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        req = urllib.request.Request(url, method=method.upper(), headers=headers or {})
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode(errors="replace")
+            resp_headers = dict(resp.headers)
+        return {
+            "status": resp.status,
+            "headers": filter_hop_by_hop(resp_headers),
+            "body": body,
+            "fetched_at": time.time(),
         }
-        key_str = json.dumps(key_parts, sort_keys=True)
-        return hashlib.sha256(key_str.encode()).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def request(
         self,
         method: str,
         url: str,
-        params: Optional[dict] = None,
-        headers: Optional[dict] = None,
-        json_body: Optional[dict] = None,
+        headers: Optional[Dict[str, str]] = None,
         bypass_cache: bool = False,
-        **kwargs,
-    ) -> requests.Response:
+        ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Perform *method* request to *url*, returning a response dict.
+
+        The response dict has keys ``status``, ``headers``, ``body``,
+        ``fetched_at``, and ``cached`` (bool).
         """
-        Make an HTTP request, returning a cached response if available.
-
-        Args:
-            method: HTTP method (GET, POST, etc.).
-            url: Target URL.
-            params: Query parameters.
-            headers: Request headers (not included in cache key).
-            json_body: JSON request body.
-            bypass_cache: If True, skip cache lookup and force a live request.
-            **kwargs: Additional arguments passed to requests.
-
-        Returns:
-            A requests.Response object.
-        """
-        cache_key = self._build_cache_key(method, url, params, json_body)
-
+        key = self._build_cache_key(method, url, headers)
         if not bypass_cache:
-            cached = self.cache.get(method, cache_key)
+            cached = self._cache.get(key)
             if cached is not None:
+                cached["cached"] = True
                 return cached
 
-        response = requests.request(
-            method,
-            url,
-            params=params,
-            headers=headers,
-            json=json_body,
-            **kwargs,
-        )
-
-        if response.ok:
-            self.cache.set(method, cache_key, response, ttl=self.ttl)
-
+        response = self._fetch(method, url, headers)
+        effective_ttl = ttl if ttl is not None else self._ttl
+        self._cache.set(key, response, ttl=effective_ttl)
+        response["cached"] = False
         return response
 
-    def get(self, url: str, **kwargs) -> requests.Response:
-        """Convenience method for GET requests."""
-        return self.request("GET", url, **kwargs)
-
-    def post(self, url: str, **kwargs) -> requests.Response:
-        """Convenience method for POST requests."""
-        return self.request("POST", url, **kwargs)
-
-    def invalidate(self, method: str, url: str, params: Optional[dict] = None, body: Optional[dict] = None) -> bool:
-        """Remove a specific entry from the cache."""
-        cache_key = self._build_cache_key(method, url, params, body)
-        return self.cache.delete(method, cache_key)
-
-    def clear(self) -> None:
-        """Clear all cached responses."""
-        self.cache.clear()
+    def get(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        bypass_cache: bool = False,
+        ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Convenience wrapper for GET requests."""
+        return self.request("GET", url, headers=headers, bypass_cache=bypass_cache, ttl=ttl)
