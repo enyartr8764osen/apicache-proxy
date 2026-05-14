@@ -1,113 +1,156 @@
-"""Caching proxy — wraps an HTTP client with cache + optional retry logic."""
+"""Caching proxy — forwards HTTP requests and caches responses.
 
-import logging
-from typing import Optional
+This version integrates request sanitization so that credentials are
+stripped from outgoing request headers and redacted from cached cache
+keys derived from query strings.
+"""
 
-import requests
+from __future__ import annotations
 
-from .cache import InMemoryCache
-from .headers import filter_hop_by_hop, normalise, headers_for_cache_key
-from .ttl import resolve, is_cacheable
-from .revalidation import conditional_headers, handle_304, has_validators
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+from .cache import Cache
 from .metrics import Metrics
 from .ratelimit import RateLimiter
 from .retry import RetryConfig, with_retry
-
-log = logging.getLogger(__name__)
+from .revalidation import conditional_headers, handle_304, has_validators
+from .sanitize import redact_query_params, strip_sensitive_headers
+from .ttl import is_cacheable, resolve
 
 
 class CachingProxy:
+    """Fetch URLs through a local cache."""
+
     def __init__(
         self,
-        cache=None,
-        storage=None,
-        default_ttl: Optional[int] = None,
+        cache: Cache,
+        default_ttl: int = 300,
         metrics: Optional[Metrics] = None,
         rate_limiter: Optional[RateLimiter] = None,
         retry_config: Optional[RetryConfig] = None,
-        session: Optional[requests.Session] = None,
-    ):
-        self._cache = cache or InMemoryCache()
-        self._storage = storage
+        sensitive_headers: Optional[List[str]] = None,
+        sensitive_params: Optional[List[str]] = None,
+    ) -> None:
+        self._cache = cache
         self._default_ttl = default_ttl
         self._metrics = metrics or Metrics()
-        self._rate_limiter = rate_limiter
-        self._retry_config = retry_config
-        self._session = session or requests.Session()
+        self._rate_limiter = rate_limiter or RateLimiter()
+        self._retry = retry_config or RetryConfig()
+        self._sensitive_headers = sensitive_headers or []
+        self._sensitive_params = sensitive_params or []
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Public interface
     # ------------------------------------------------------------------
 
-    def _build_cache_key(self, method: str, url: str, headers: dict) -> str:
-        norm = headers_for_cache_key(normalise(headers))
-        return f"{method.upper()}:{url}:{sorted(norm.items())}"
-
-    def _fetch(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Issue the real HTTP request, honouring retry config if set."""
-        if self._rate_limiter:
-            self._rate_limiter.acquire()
-
-        def _do():
-            return self._session.request(method, url, **kwargs)
-
-        if self._retry_config:
-            return with_retry(_do, self._retry_config)
-        return _do()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def get(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        bypass_cache: bool = False,
+        explicit_ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._do(
+            "GET", url, headers=headers,
+            bypass_cache=bypass_cache, explicit_ttl=explicit_ttl,
+        )
 
     def request(
         self,
         method: str,
         url: str,
-        headers: Optional[dict] = None,
+        headers: Optional[Dict[str, str]] = None,
         bypass_cache: bool = False,
-        ttl: Optional[int] = None,
-        **kwargs,
-    ) -> requests.Response:
-        headers = normalise(headers or {})
-        key = self._build_cache_key(method, url, headers)
+        explicit_ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._do(
+            method, url, headers=headers,
+            bypass_cache=bypass_cache, explicit_ttl=explicit_ttl,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_cache_key(self, method: str, url: str) -> str:
+        """Build a cache key, redacting sensitive query parameters."""
+        parsed = urllib.parse.urlsplit(url)
+        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        clean_params = redact_query_params(params, extra=self._sensitive_params)
+        clean_query = urllib.parse.urlencode(clean_params)
+        clean_url = parsed._replace(query=clean_query).geturl()
+        return f"{method.upper()}:{clean_url}"
+
+    def _fetch(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Perform a real HTTP request, stripping sensitive headers first."""
+        safe_headers = strip_sensitive_headers(
+            headers, extra=self._sensitive_headers
+        )
+        self._rate_limiter.acquire()
+        req = urllib.request.Request(url, headers=safe_headers, method=method)
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            resp_headers = dict(resp.headers)
+            return {
+                "status": resp.status,
+                "headers": resp_headers,
+                "body": body,
+            }
+
+    def _do(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        bypass_cache: bool = False,
+        explicit_ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        headers = headers or {}
+        key = self._build_cache_key(method, url)
+
+        if not bypass_cache:
+            entry = self._cache.get(key)
+            if entry is not None:
+                if has_validators(entry):
+                    cond = conditional_headers(entry)
+                    merged = {**headers, **cond}
+                    try:
+                        result = with_retry(self._retry, self._fetch, method, url, merged)
+                        if result["status"] == 304:
+                            self._metrics.record_hit()
+                            return handle_304(entry)
+                    except urllib.error.HTTPError:
+                        pass
+                self._metrics.record_hit()
+                return entry.to_dict()
 
         if bypass_cache:
             self._metrics.record_bypass()
-            return self._fetch(method, url, headers=headers, **kwargs)
-
-        entry = self._cache.get(key)
-        if entry is None and self._storage:
-            entry = self._storage.get(key)
-
-        if entry is not None:
-            if has_validators(entry):
-                cond = conditional_headers(entry)
-                resp = self._fetch(method, url, headers={**headers, **cond}, **kwargs)
-                if resp.status_code == 304:
-                    self._metrics.record_hit()
-                    return handle_304(entry, resp)
-
-            self._metrics.record_hit()
-            log.debug("cache hit: %s", key)
-            return entry.as_response()
+        else:
+            self._metrics.record_miss()
 
         try:
-            resp = self._fetch(method, url, headers=headers, **kwargs)
-        except Exception as exc:
+            result = with_retry(self._retry, self._fetch, method, url, headers)
+        except Exception:
             self._metrics.record_error()
             raise
 
-        self._metrics.record_miss()
+        if is_cacheable(result["status"]) and not bypass_cache:
+            ttl = resolve(
+                explicit_ttl,
+                result["headers"],
+                self._default_ttl,
+            )
+            if ttl > 0:
+                self._cache.set(key, result, ttl)
 
-        effective_ttl = resolve(
-            ttl if ttl is not None else self._default_ttl,
-            dict(resp.headers),
-        )
-        if is_cacheable(resp.status_code, effective_ttl):
-            from .cache import CacheEntry
-            entry = CacheEntry.from_response(resp, ttl=effective_ttl)
-            self._cache.set(key, entry)
-            if self._storage:
-                self._storage.set(key, entry)
-
-        return resp
+        return result
