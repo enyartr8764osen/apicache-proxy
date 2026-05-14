@@ -1,79 +1,49 @@
-"""Caching proxy that wraps an HTTP client and stores responses locally."""
-
+"""CachingProxy — wraps an HTTP client with cache + metrics."""
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from typing import Any, Dict, Optional
 
-import urllib.request
-import urllib.error
+import requests
 
 from .cache import Cache
-from .headers import filter_hop_by_hop, headers_for_cache_key
+from .headers import filter_hop_by_hop, headers_for_cache_key, normalise
+from .metrics import Metrics
+from .revalidation import conditional_headers, handle_304, has_validators
+from .ttl import is_cacheable, resolve
 
 
 class CachingProxy:
-    """Fetch URLs through a local cache.
-
-    Parameters
-    ----------
-    cache:
-        A :class:`~apicache_proxy.cache.Cache` instance used for storage.
-    ttl:
-        Default time-to-live in seconds for cached responses (default 300).
-    include_headers_in_key:
-        When *True*, request headers (after filtering) are folded into the
-        cache key so that different auth tokens produce separate entries.
-    """
+    """Fetch URLs through a local cache, recording metrics for each outcome."""
 
     def __init__(
         self,
         cache: Cache,
-        ttl: int = 300,
-        include_headers_in_key: bool = False,
+        default_ttl: int = 300,
+        metrics: Optional[Metrics] = None,
     ) -> None:
         self._cache = cache
-        self._ttl = ttl
-        self._include_headers_in_key = include_headers_in_key
+        self._default_ttl = default_ttl
+        self.metrics: Metrics = metrics if metrics is not None else Metrics()
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Internal helpers
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
-    def _build_cache_key(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict[str, str]] = None,
-    ) -> str:
-        parts: Dict[str, Any] = {"method": method.upper(), "url": url}
-        if self._include_headers_in_key and headers:
-            parts["headers"] = headers_for_cache_key(headers)
-        raw = json.dumps(parts, sort_keys=True)
-        return hashlib.sha256(raw.encode()).hexdigest()
+    def _build_cache_key(self, method: str, url: str, headers: Dict[str, str]) -> str:
+        stable = headers_for_cache_key(normalise(headers))
+        return f"{method.upper()}:{url}:{stable}"
 
     def _fetch(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        req = urllib.request.Request(url, method=method.upper(), headers=headers or {})
-        with urllib.request.urlopen(req) as resp:
-            body = resp.read().decode(errors="replace")
-            resp_headers = dict(resp.headers)
-        return {
-            "status": resp.status,
-            "headers": filter_hop_by_hop(resp_headers),
-            "body": body,
-            "fetched_at": time.time(),
-        }
+        self, method: str, url: str, headers: Dict[str, str], **kwargs: Any
+    ) -> requests.Response:
+        resp = requests.request(method, url, headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Public API
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     def request(
         self,
@@ -82,31 +52,58 @@ class CachingProxy:
         headers: Optional[Dict[str, str]] = None,
         bypass_cache: bool = False,
         ttl: Optional[int] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Perform *method* request to *url*, returning a response dict.
-
-        The response dict has keys ``status``, ``headers``, ``body``,
-        ``fetched_at``, and ``cached`` (bool).
-        """
+        headers = normalise(headers or {})
         key = self._build_cache_key(method, url, headers)
+
         if not bypass_cache:
-            cached = self._cache.get(key)
-            if cached is not None:
-                cached["cached"] = True
-                return cached
+            entry = self._cache.get(key)
+            if entry is not None:
+                cond = conditional_headers(entry)
+                if cond and has_validators(entry):
+                    try:
+                        resp = self._fetch(method, url, {**headers, **cond}, **kwargs)
+                        if resp.status_code == 304:
+                            self.metrics.record_hit()
+                            return handle_304(entry)
+                    except requests.HTTPError:
+                        pass
+                else:
+                    self.metrics.record_hit()
+                    return entry.to_dict()
+        else:
+            self.metrics.record_bypass()
 
-        response = self._fetch(method, url, headers)
-        effective_ttl = ttl if ttl is not None else self._ttl
-        self._cache.set(key, response, ttl=effective_ttl)
-        response["cached"] = False
-        return response
+        # Cache miss (or bypass) — go to network
+        try:
+            resp = self._fetch(method, url, headers, **kwargs)
+        except Exception:
+            self.metrics.record_error()
+            raise
 
-    def get(
-        self,
-        url: str,
-        headers: Optional[Dict[str, str]] = None,
-        bypass_cache: bool = False,
-        ttl: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Convenience wrapper for GET requests."""
-        return self.request("GET", url, headers=headers, bypass_cache=bypass_cache, ttl=ttl)
+        resp_headers = filter_hop_by_hop(dict(resp.headers))
+        effective_ttl = resolve(ttl, resp_headers, self._default_ttl)
+
+        if not bypass_cache and is_cacheable(resp.status_code, resp_headers):
+            from .cache import CacheEntry  # local import to avoid circular
+
+            entry = CacheEntry(
+                key=key,
+                status_code=resp.status_code,
+                headers=resp_headers,
+                body=resp.text,
+                created_at=time.time(),
+                ttl=effective_ttl,
+            )
+            self._cache.set(key, entry)
+
+        if not bypass_cache:
+            self.metrics.record_miss()
+
+        return {
+            "status_code": resp.status_code,
+            "headers": resp_headers,
+            "body": resp.text,
+            "from_cache": False,
+        }
