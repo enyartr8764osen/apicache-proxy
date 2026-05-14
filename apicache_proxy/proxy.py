@@ -1,109 +1,113 @@
-"""CachingProxy — wraps an HTTP client with cache + metrics."""
-from __future__ import annotations
+"""Caching proxy — wraps an HTTP client with cache + optional retry logic."""
 
-import time
-from typing import Any, Dict, Optional
+import logging
+from typing import Optional
 
 import requests
 
-from .cache import Cache
-from .headers import filter_hop_by_hop, headers_for_cache_key, normalise
-from .metrics import Metrics
+from .cache import InMemoryCache
+from .headers import filter_hop_by_hop, normalise, headers_for_cache_key
+from .ttl import resolve, is_cacheable
 from .revalidation import conditional_headers, handle_304, has_validators
-from .ttl import is_cacheable, resolve
+from .metrics import Metrics
+from .ratelimit import RateLimiter
+from .retry import RetryConfig, with_retry
+
+log = logging.getLogger(__name__)
 
 
 class CachingProxy:
-    """Fetch URLs through a local cache, recording metrics for each outcome."""
-
     def __init__(
         self,
-        cache: Cache,
-        default_ttl: int = 300,
+        cache=None,
+        storage=None,
+        default_ttl: Optional[int] = None,
         metrics: Optional[Metrics] = None,
-    ) -> None:
-        self._cache = cache
+        rate_limiter: Optional[RateLimiter] = None,
+        retry_config: Optional[RetryConfig] = None,
+        session: Optional[requests.Session] = None,
+    ):
+        self._cache = cache or InMemoryCache()
+        self._storage = storage
         self._default_ttl = default_ttl
-        self.metrics: Metrics = metrics if metrics is not None else Metrics()
+        self._metrics = metrics or Metrics()
+        self._rate_limiter = rate_limiter
+        self._retry_config = retry_config
+        self._session = session or requests.Session()
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
 
-    def _build_cache_key(self, method: str, url: str, headers: Dict[str, str]) -> str:
-        stable = headers_for_cache_key(normalise(headers))
-        return f"{method.upper()}:{url}:{stable}"
+    def _build_cache_key(self, method: str, url: str, headers: dict) -> str:
+        norm = headers_for_cache_key(normalise(headers))
+        return f"{method.upper()}:{url}:{sorted(norm.items())}"
 
-    def _fetch(
-        self, method: str, url: str, headers: Dict[str, str], **kwargs: Any
-    ) -> requests.Response:
-        resp = requests.request(method, url, headers=headers, **kwargs)
-        resp.raise_for_status()
-        return resp
+    def _fetch(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Issue the real HTTP request, honouring retry config if set."""
+        if self._rate_limiter:
+            self._rate_limiter.acquire()
 
-    # ------------------------------------------------------------------ #
+        def _do():
+            return self._session.request(method, url, **kwargs)
+
+        if self._retry_config:
+            return with_retry(_do, self._retry_config)
+        return _do()
+
+    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
 
     def request(
         self,
         method: str,
         url: str,
-        headers: Optional[Dict[str, str]] = None,
+        headers: Optional[dict] = None,
         bypass_cache: bool = False,
         ttl: Optional[int] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
+        **kwargs,
+    ) -> requests.Response:
         headers = normalise(headers or {})
         key = self._build_cache_key(method, url, headers)
 
-        if not bypass_cache:
-            entry = self._cache.get(key)
-            if entry is not None:
-                cond = conditional_headers(entry)
-                if cond and has_validators(entry):
-                    try:
-                        resp = self._fetch(method, url, {**headers, **cond}, **kwargs)
-                        if resp.status_code == 304:
-                            self.metrics.record_hit()
-                            return handle_304(entry)
-                    except requests.HTTPError:
-                        pass
-                else:
-                    self.metrics.record_hit()
-                    return entry.to_dict()
-        else:
-            self.metrics.record_bypass()
+        if bypass_cache:
+            self._metrics.record_bypass()
+            return self._fetch(method, url, headers=headers, **kwargs)
 
-        # Cache miss (or bypass) — go to network
+        entry = self._cache.get(key)
+        if entry is None and self._storage:
+            entry = self._storage.get(key)
+
+        if entry is not None:
+            if has_validators(entry):
+                cond = conditional_headers(entry)
+                resp = self._fetch(method, url, headers={**headers, **cond}, **kwargs)
+                if resp.status_code == 304:
+                    self._metrics.record_hit()
+                    return handle_304(entry, resp)
+
+            self._metrics.record_hit()
+            log.debug("cache hit: %s", key)
+            return entry.as_response()
+
         try:
-            resp = self._fetch(method, url, headers, **kwargs)
-        except Exception:
-            self.metrics.record_error()
+            resp = self._fetch(method, url, headers=headers, **kwargs)
+        except Exception as exc:
+            self._metrics.record_error()
             raise
 
-        resp_headers = filter_hop_by_hop(dict(resp.headers))
-        effective_ttl = resolve(ttl, resp_headers, self._default_ttl)
+        self._metrics.record_miss()
 
-        if not bypass_cache and is_cacheable(resp.status_code, resp_headers):
-            from .cache import CacheEntry  # local import to avoid circular
-
-            entry = CacheEntry(
-                key=key,
-                status_code=resp.status_code,
-                headers=resp_headers,
-                body=resp.text,
-                created_at=time.time(),
-                ttl=effective_ttl,
-            )
+        effective_ttl = resolve(
+            ttl if ttl is not None else self._default_ttl,
+            dict(resp.headers),
+        )
+        if is_cacheable(resp.status_code, effective_ttl):
+            from .cache import CacheEntry
+            entry = CacheEntry.from_response(resp, ttl=effective_ttl)
             self._cache.set(key, entry)
+            if self._storage:
+                self._storage.set(key, entry)
 
-        if not bypass_cache:
-            self.metrics.record_miss()
-
-        return {
-            "status_code": resp.status_code,
-            "headers": resp_headers,
-            "body": resp.text,
-            "from_cache": False,
-        }
+        return resp
