@@ -53,6 +53,14 @@ def test_metrics_reset_after_stats_call():
     assert m.to_dict()["hit_rate"] == 0.0
 
 
+def test_metrics_zero_total_hit_rate_is_zero():
+    """Ensure hit_rate is 0.0 when no requests have been recorded (avoids ZeroDivisionError)."""
+    m = Metrics()
+    d = m.to_dict()
+    assert d["total"] == 0
+    assert d["hit_rate"] == 0.0
+
+
 def test_cmd_stats_prints_json(capsys):
     mock_storage = MagicMock()
     mock_storage.stats.return_value = {"entries": 4, "size_bytes": 1024}
