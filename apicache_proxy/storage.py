@@ -53,6 +53,24 @@ class DiskStorage:
             removed += 1
         return removed
 
+    def evict_expired(self) -> int:
+        """Remove all expired cache entries from disk.
+
+        Returns the number of entries removed.
+        """
+        removed = 0
+        for path in self.cache_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                entry = CacheEntry.from_dict(data)
+                if entry.is_expired():
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                path.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
     def stats(self) -> dict:
         total = 0
         expired = 0
